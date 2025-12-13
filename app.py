@@ -9,21 +9,26 @@ import textwrap
 import sys
 import re
 import httpx
+import colorama
+import socket
+from colorama import Fore, Style
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-CONFIG_DIR = os.path.join(BASE_DIR, "config_data")
+CONFIG_DIR = os.path.join(BASE_DIR, "app_config_data")
 os.makedirs(CONFIG_DIR, exist_ok=True)
 
 CONFIG_FILE = os.path.join(CONFIG_DIR, "client_config.json")
-CLIENT_VERSION = "v.1.0.0-stable"
+CLIENT_VERSION = "v.1.0.1-stable"
 
-DEFAULT_SERVER = "http://omx.dedyn.io:30174"
+# server als IP en poort
+DEFAULT_SERVER_HOST = "omx.dedyn.io"
+DEFAULT_SERVER_PORT = 30174
+
+# handig combineren voor gebruik
+DEFAULT_SERVER = f"http://{DEFAULT_SERVER_HOST}:{DEFAULT_SERVER_PORT}"
 TIMEOUT = 6 
-PAGE_SIZE = 15
-
-import colorama
-from colorama import Fore, Style
+PAGE_SIZE = 12
 
 # init Colorama
 colorama.init(autoreset=True)
@@ -213,14 +218,27 @@ def send_request(endpoint, payload):
     try:
         token = CONFIG.get("token")
         headers = {"Authorization": f"Bearer {token}"} if token else {}
-        with httpx.Client(timeout=10) as client:
-            r = client.post(SERVER_URL + endpoint, json=payload, headers=headers)
-            r.raise_for_status()
+        with httpx.Client(timeout=TIMEOUT) as client:
+            r = client.post(f"http://{DEFAULT_SERVER_HOST}:{DEFAULT_SERVER_PORT}{endpoint}",
+                            json=payload, headers=headers)
+            r.raise_for_status()  # raise bij HTTP errors (4xx/5xx)
             resp = r.json()
-            return resp.get("ok", False), resp
+            if resp.get("ok"):
+                return True, resp
+            else:
+                # server gaf een foutmelding terug
+                err_msg = resp.get("error") or "Unknown server error"
+                return False, {"error": err_msg}
+    except httpx.TimeoutException:
+        return False, {"error": "Request timed out."}
+    except httpx.RequestError as e:
+        return False, {"error": f"Connection error: {str(e)}"}
+    except ValueError:
+        # JSON decode error
+        return False, {"error": "Invalid response from server."}
     except Exception as e:
-        return False, {"error": str(e)}
-
+        return False, {"error": f"Unexpected error: {str(e)}"}
+            
 def action_send():
     if not require_login_flow():
         return
@@ -544,10 +562,24 @@ def action_remove_spam_sender():
 
 def clear_screen():
     os.system("cls" if os.name == "nt" else "clear")
+    
+def check_server():
+    printc("Loading...", C.BLUE)
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(TIMEOUT)
+    try:
+        s.connect((DEFAULT_SERVER_HOST, DEFAULT_SERVER_PORT))
+        s.close()
+        return True
+    except Exception:
+        printc("Error connecting to server. Aborting...", C.RED)
+        time.sleep(1)
+        sys.exit(1)
 
 # ---------- Main menu ----------
 def main_menu():
     while True:
+        check_server()
         clear_screen()
         user = CONFIG.get("username")
         print(f"{C.BOLD}{C.BLUE}╔══════════════════════════════════╗{C.END}")
@@ -637,3 +669,4 @@ def main_menu():
             printc("Invalid choice.", C.RED)
             time.sleep(0.7)
           
+main_menu()
