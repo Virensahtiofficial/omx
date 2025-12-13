@@ -1,258 +1,318 @@
 #!/usr/bin/env python3
-"""
-OMX Admin CLI
-- Uses the regular /login endpoint (requires an admin account)
-- Uses admin endpoints present on the server:
-    POST /admin/ban            -> {"username": "<user>"}
-    POST /admin/unban          -> {"username": "<user>"}
-    POST /admin/delete_user    -> {"username": "<user>"}
-    POST /admin/broadcast      -> {"subject": "...", "message": "..."}
-- All state is in-memory. Token stored in RAM only.
-- Robust error handling / confirmations / clear output.
-"""
-
 from __future__ import annotations
-import requests
-import getpass
 import sys
+import asyncio
+import argparse
+import getpass
+import json
 import time
+import random
 import textwrap
+import httpx
 
-# -------- Config --------
-DEFAULT_SERVER = "http://omx.dedyn.io:30174"   # change if needed
-TIMEOUT = 8  # seconds
-API_PREFIXES = {
-    "ban": "/admin/ban",
-    "unban": "/admin/unban",
-    "delete_user": "/admin/delete_user",
-    "broadcast": "/admin/broadcast",
-}
-
-# -------- UI helpers --------
 class C:
     HEADER = '\033[95m'; BLUE = '\033[94m'; CYAN = '\033[96m'
     GREEN = '\033[92m'; YELLOW = '\033[93m'; RED = '\033[91m'
     END = '\033[0m'; BOLD = '\033[1m'
 
-def color(s, col=C.END):
+def color(s: str, col: str = C.END) -> str:
     return f"{col}{s}{C.END}"
 
-def printc(s, col=C.END):
+def prin(s: str, col: str = C.END) -> None:
     print(color(s, col))
 
-def pause(msg="Press Enter to continue..."):
+def confirm(prompt: str) -> bool:
     try:
-        input(color(msg, C.BLUE))
+        r = input(color(prompt + " [y/N]: ", C.YELLOW)).strip().lower()
     except KeyboardInterrupt:
         print()
+        return False
+    return r in ("y", "yes")
 
-def confirm(prompt: str) -> bool:
-    ans = input(color(prompt + " [y/N]: ", C.YELLOW)).strip().lower()
-    return ans in ("y", "yes")
-
-# -------- HTTP helper --------
 class APIError(Exception):
-    pass
+    def __init__(self, detail):
+        super().__init__(str(detail))
+        self.detail = detail
 
-class AdminClient:
-    def __init__(self, server_url: str = DEFAULT_SERVER):
-        self.server_url = server_url.rstrip("/")
+class HTTPXAdminClient:
+    def __init__(self, base_url: str, timeout: int = 8, retries: int = 3, backoff: float = 0.4):
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self.retries = max(1, int(retries))
+        self.backoff = float(backoff)
         self.token: str | None = None
         self.username: str | None = None
-        self.role: str | None = None
+        self._client: httpx.AsyncClient | None = None
 
     def _url(self, path: str) -> str:
-        return self.server_url + path
+        return self.base_url + path
 
-    def send_request(self, path: str, payload: dict | None = None, method: str = "POST", params: dict | None = None):
-        url = self._url(path)
-        headers = {}
-        if self.token:
-            headers["Authorization"] = f"Bearer {self.token}"
-        try:
-            if method.upper() == "POST":
-                r = requests.post(url, json=payload or {}, headers=headers, timeout=TIMEOUT)
-            else:
-                r = requests.get(url, params=params or {}, headers=headers, timeout=TIMEOUT)
-        except requests.RequestException as e:
-            raise APIError(f"Network error: {e}")
+    async def _client_ctx(self):
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=self.timeout)
+        return self._client
 
-        # try parse JSON
-        try:
-            data = r.json()
-        except Exception:
-            raise APIError(f"Invalid JSON response (status {r.status_code}) from {url}")
+    async def _request(self, path: str, method: str = "POST", json_payload: dict | None = None, params: dict | None = None):
+        async def do_once():
+            client = await self._client_ctx()
+            headers = {}
+            if self.token:
+                headers["Authorization"] = f"Bearer {self.token}"
+            try:
+                if method.upper() == "POST":
+                    r = await client.post(self._url(path), json=json_payload or {}, headers=headers)
+                else:
+                    r = await client.get(self._url(path), params=params or {}, headers=headers)
+            except httpx.RequestError as e:
+                raise APIError(f"request error: {e}") from e
+            try:
+                data = r.json()
+            except Exception:
+                raise APIError(f"invalid json from server (status {r.status_code})")
+            if r.status_code >= 400:
+                raise APIError({"status": r.status_code, "body": data})
+            if isinstance(data, dict) and data.get("ok") is False:
+                raise APIError(data)
+            return data
 
-        # server returns JSON with ok:false for errors; treat >=400 also as error
-        if r.status_code >= 400 or (isinstance(data, dict) and data.get("ok") is False):
-            # forward server-side error dictionary/messages
-            raise APIError(data)
-        return data
+        last_exc = None
+        for attempt in range(self.retries):
+            try:
+                return await do_once()
+            except APIError as e:
+                last_exc = e
+                if attempt + 1 >= self.retries:
+                    raise
+                await asyncio.sleep(self.backoff * (2 ** attempt) + random.random() * 0.1)
+        raise last_exc
 
-    # -------- Auth --------
-    def login(self) -> bool:
-        printc("=== ADMIN LOGIN ===", C.HEADER)
-        u = input("Username: ").strip()
-        if not u:
-            printc("Cancelled.", C.YELLOW)
-            return False
-        p = getpass.getpass("Password: ")
-        try:
-            resp = self.send_request("/login", {"username": u, "password": p}, method="POST")
-        except APIError as e:
-            printc(f"Login failed: {e}", C.RED)
-            return False
+    async def close(self):
+        if self._client:
+            await self._client.aclose()
+            self._client = None
 
-        # ensure the response contains token and role
+    async def login(self, username: str, password: str):
+        payload = {"username": username, "password": password}
+        resp = await self._request("/login", "POST", json_payload=payload)
         token = resp.get("token")
         role = resp.get("role")
         if not token:
-            printc("Login succeeded but server did not return token.", C.RED)
-            return False
-        if role != "admin":
-            printc("That account is not an admin (role != 'admin').", C.RED)
-            return False
-
-        # success
+            raise APIError("no token returned by server")
         self.token = token
-        self.username = u.lower()
-        self.role = role
-        printc(f"Admin logged in as {self.username}. Token stored in RAM.", C.GREEN)
-        return True
+        self.username = username.lower()
+        return {"token": token, "role": role, "expires": resp.get("expires")}
 
-    # -------- Admin actions --------
-    def ban_user(self, target: str):
-        target = (target or "").strip().lower()
-        if not target:
-            printc("No username provided.", C.YELLOW); return
-        if target == self.username:
-            printc("You cannot ban yourself.", C.RED); return
-        if not confirm(f"Confirm ban user '{target}'?"):
-            printc("Cancelled.", C.YELLOW); return
+    async def ban_user(self, target: str):
+        payload = {"username": target}
+        return await self._request("/admin/ban", "POST", json_payload=payload)
+
+    async def unban_user(self, target: str):
+        payload = {"username": target}
+        return await self._request("/admin/unban", "POST", json_payload=payload)
+
+    async def delete_user(self, target: str):
+        payload = {"username": target}
+        return await self._request("/admin/delete_user", "POST", json_payload=payload)
+
+    async def broadcast(self, subject: str, message: str):
+        payload = {"subject": subject, "message": message}
+        return await self._request("/admin/broadcast", "POST", json_payload=payload)
+
+class CommandRegistry:
+    def __init__(self):
+        self._commands: dict[str, tuple[str, callable]] = {}
+
+    def register(self, name: str, desc: str, func: callable):
+        self._commands[name] = (desc, func)
+
+    def get(self, name: str):
+        return self._commands.get(name)
+
+    def all(self):
+        return self._commands.items()
+
+class AdminCLI:
+    def __init__(self, client: HTTPXAdminClient):
+        self.client = client
+        self.registry = CommandRegistry()
+        self._register_core_commands()
+
+    def _register_core_commands(self):
+        self.registry.register("ban", "Ban a user", self.cmd_ban)
+        self.registry.register("unban", "Unban a user", self.cmd_unban)
+        self.registry.register("delete", "Delete a user", self.cmd_delete)
+        self.registry.register("broadcast", "Broadcast message to all users", self.cmd_broadcast)
+        self.registry.register("exit", "Exit CLI", self.cmd_exit)
+
+    async def run(self):
+        await self._login_flow()
         try:
-            resp = self.send_request(API_PREFIXES["ban"], {"username": target}, method="POST")
-        except APIError as e:
-            printc(f"Ban failed: {e}", C.RED); return
-        printc(f"User '{target}' banned. Server response: {resp}", C.GREEN)
-
-    def unban_user(self, target: str):
-        target = (target or "").strip().lower()
-        if not target:
-            printc("No username provided.", C.YELLOW); return
-        if not confirm(f"Confirm unban user '{target}'?"):
-            printc("Cancelled.", C.YELLOW); return
-        try:
-            resp = self.send_request(API_PREFIXES["unban"], {"username": target}, method="POST")
-        except APIError as e:
-            printc(f"Unban failed: {e}", C.RED); return
-        printc(f"User '{target}' unbanned. Server response: {resp}", C.GREEN)
-
-    def delete_user(self, target: str):
-        target = (target or "").strip().lower()
-        if not target:
-            printc("No username provided.", C.YELLOW); return
-        if target == self.username:
-            printc("You cannot delete your own admin account here. Use a different admin account.", C.RED); return
-        if not confirm(f"*** PERMANENTLY DELETE user '{target}' and all their data? This cannot be undone. Confirm"): 
-            printc("Cancelled.", C.YELLOW); return
-        try:
-            resp = self.send_request(API_PREFIXES["delete_user"], {"username": target}, method="POST")
-        except APIError as e:
-            printc(f"Delete failed: {e}", C.RED); return
-        printc(f"User '{target}' deleted. Server response: {resp}", C.GREEN)
-
-    def broadcast(self, subject: str, message: str):
-        subject = (subject or "").strip()
-        message = (message or "").strip()
-        if not subject or not message:
-            printc("Missing subject or message.", C.YELLOW); return
-        printc(f"Broadcast Subject: {subject}", C.CYAN)
-        for line in textwrap.wrap(message, width=78):
-            print(line)
-        if not confirm("Send this broadcast to ALL users?"):
-            printc("Cancelled.", C.YELLOW); return
-        try:
-            resp = self.send_request(API_PREFIXES["broadcast"], {"subject": subject, "message": message}, method="POST")
-        except APIError as e:
-            printc(f"Broadcast failed: {e}", C.RED); return
-        printc("Broadcast sent. Server response:", C.GREEN)
-        print(resp)
-
-    # optional convenience: try to call /admin/list_users if server provides it
-    def list_users_if_available(self):
-        # path many servers might not implement; call gracefully
-        try:
-            resp = self.send_request("/admin/list_users", method="GET")
-        except APIError as e:
-            printc("Server does not expose /admin/list_users (or error):", C.YELLOW)
-            printc(f"  {e}", C.YELLOW)
-            return
-        users = resp.get("users") or resp.get("data") or []
-        printc("=== Registered users ===", C.CYAN)
-        for u in users:
-            printc(f" - {u}", C.GREEN)
-
-# -------- CLI --------
-def main_menu(client: AdminClient):
-    while True:
-        printc("\n=== OMX ADMIN CLI ===", C.HEADER)
-        printc(f"Admin: {client.username or 'NOT LOGGED IN'}", C.GREEN)
-        printc("1) Ban user", C.CYAN)
-        printc("2) Unban user", C.CYAN)
-        printc("3) Delete user", C.CYAN)
-        printc("4) Broadcast message", C.CYAN)
-        printc("0) Quit", C.YELLOW)
-        choice = input("Choice: ").strip()
-        if choice == "0":
-            printc("Bye.", C.GREEN); sys.exit(0)
-        if choice == "1":
-            u = input("Username to ban: ").strip()
-            client.ban_user(u)
-            pause()
-        elif choice == "2":
-            u = input("Username to unban: ").strip()
-            client.unban_user(u)
-            pause()
-        elif choice == "3":
-            u = input("Username to delete: ").strip()
-            client.delete_user(u)
-            pause()
-        elif choice == "4":
-            subj = input("Broadcast subject: ").strip()
-            printc("Enter message. Finish with a single '.' on a line.", C.YELLOW)
-            lines = []
             while True:
+                self._print_header()
                 try:
-                    ln = input()
+                    cmd = input(color("Choice (type 'help' for commands): ", C.CYAN)).strip()
                 except KeyboardInterrupt:
-                    print(); break
-                if ln == ".":
-                    break
-                lines.append(ln)
-            msg = "\n".join(lines).strip()
-            client.broadcast(subj, msg)
-            pause()
-        else:
-            printc("Invalid choice.", C.RED)
-            time.sleep(0.4)
+                    print()
+                    cmd = "exit"
+                if not cmd:
+                    continue
+                if cmd == "help":
+                    self._print_help()
+                    continue
+                parts = cmd.split()
+                name = parts[0]
+                args = parts[1:]
+                entry = self.registry.get(name)
+                if not entry:
+                    prin("Unknown command, type 'help'", C.YELLOW)
+                    continue
+                func = entry[1]
+                try:
+                    await func(args)
+                except APIError as e:
+                    prin(f"API error: {e}", C.RED)
+                    if isinstance(e.detail, dict):
+                        try:
+                            prin(json.dumps(e.detail, indent=2, ensure_ascii=False), C.RED)
+                        except Exception:
+                            pass
+                except Exception as e:
+                    prin(f"Error: {e}", C.RED)
+        finally:
+            await self.client.close()
 
-# -------- Entry point --------
-def parse_args_and_run():
-    server = DEFAULT_SERVER
-    if len(sys.argv) > 1:
-        server = sys.argv[1]
-    client = AdminClient(server)
-    # login
-    ok = client.login()
-    if not ok:
-        printc("Login failed - exiting.", C.RED)
-        sys.exit(1)
-    try:
-        main_menu(client)
-    except KeyboardInterrupt:
-        print()
-        printc("Interrupted. Bye.", C.YELLOW)
+    async def _login_flow(self):
+        while True:
+            prin("=== Admin login ===", C.HEADER)
+            try:
+                username = input(color("Username: ", C.BLUE)).strip()
+            except KeyboardInterrupt:
+                print()
+                sys.exit(1)
+            if not username:
+                prin("Cancelled", C.YELLOW); sys.exit(1)
+            pwd = getpass.getpass("Password: ")
+            try:
+                info = await self.client.login(username, pwd)
+            except APIError as e:
+                prin(f"Login failed: {e}", C.RED)
+                continue
+            role = info.get("role")
+            if role != "admin":
+                prin("Account is not admin (role != 'admin')", C.RED)
+                continue
+            prin(f"Logged in as {username}", C.GREEN)
+            return
+
+    def _print_header(self):
+        prin("", C.END)
+        prin(f"Admin: {self.client.username or 'NOT LOGGED IN'}", C.GREEN)
+        prin("Commands:", C.CYAN)
+        for k, (desc, _) in self.registry._commands.items():
+            prin(f"  {k:12} - {desc}", C.BLUE)
+
+    def _print_help(self):
+        prin("Available commands:", C.CYAN)
+        for name, (desc, _) in self.registry._commands.items():
+            prin(f"  {name:12} - {desc}", C.BLUE)
+
+    async def cmd_ban(self, args: list[str]):
+        if not args:
+            target = input(color("Username to ban: ", C.BLUE)).strip().lower()
+        else:
+            target = args[0].lower()
+        if not target:
+            prin("No username provided", C.YELLOW); return
+        if target == self.client.username:
+            prin("Cannot ban yourself", C.RED); return
+        if not confirm(f"Confirm ban {target}?"):
+            prin("Cancelled", C.YELLOW); return
+        resp = await self.client.ban_user(target)
+        prin(f"Banned {target}", C.GREEN)
+        prin(json.dumps(resp, indent=2, ensure_ascii=False), C.CYAN)
+
+    async def cmd_unban(self, args: list[str]):
+        if not args:
+            target = input(color("Username to unban: ", C.BLUE)).strip().lower()
+        else:
+            target = args[0].lower()
+        if not target:
+            prin("No username provided", C.YELLOW); return
+        if not confirm(f"Confirm unban {target}?"):
+            prin("Cancelled", C.YELLOW); return
+        resp = await self.client.unban_user(target)
+        prin(f"Unbanned {target}", C.GREEN)
+        prin(json.dumps(resp, indent=2, ensure_ascii=False), C.CYAN)
+
+    async def cmd_delete(self, args: list[str]):
+        if not args:
+            target = input(color("Username to delete: ", C.RED)).strip().lower()
+        else:
+            target = args[0].lower()
+        if not target:
+            prin("No username provided", C.YELLOW); return
+        if target == self.client.username:
+            prin("Cannot delete your own admin account here", C.RED); return
+        if not confirm(f"*** PERMANENT DELETE {target}? This cannot be undone. Confirm"):
+            prin("Cancelled", C.YELLOW); return
+        resp = await self.client.delete_user(target)
+        prin(f"Deleted {target}", C.GREEN)
+        prin(json.dumps(resp, indent=2, ensure_ascii=False), C.CYAN)
+
+    async def cmd_broadcast(self, args: list[str]):
+        subj = ""
+        if args:
+            subj = args[0]
+        if not subj:
+            subj = input(color("Broadcast subject: ", C.BLUE)).strip()
+        if not subj:
+            prin("Missing subject", C.YELLOW); return
+        prin("Enter message. End with a single '.' on a line.", C.YELLOW)
+        lines = []
+        while True:
+            try:
+                ln = input()
+            except KeyboardInterrupt:
+                print(); break
+            if ln == ".":
+                break
+            lines.append(ln)
+        msg = "\n".join(lines).strip()
+        if not msg:
+            prin("Empty message", C.YELLOW); return
+        prin("Preview:", C.CYAN)
+        prin(f"Subject: {subj}", C.BLUE)
+        for line in textwrap.wrap(msg, width=78):
+            prin(line, C.CYAN)
+        if not confirm("Send broadcast to ALL users?"):
+            prin("Cancelled", C.YELLOW); return
+        resp = await self.client.broadcast(subj, msg)
+        prin("Broadcast sent", C.GREEN)
+        prin(json.dumps(resp, indent=2, ensure_ascii=False), C.CYAN)
+
+    async def cmd_exit(self, args: list[str]):
+        prin("Bye", C.GREEN)
+        await self.client.close()
         sys.exit(0)
 
+async def main_async(argv):
+    p = argparse.ArgumentParser()
+    p.add_argument("--server", "-s", default="http://omx.dedyn.io:30174")
+    p.add_argument("--timeout", "-t", type=int, default=8)
+    p.add_argument("--retries", "-r", type=int, default=4)
+    p.add_argument("--backoff", "-b", type=float, default=0.4)
+    args = p.parse_args(argv[1:])
+    client = HTTPXAdminClient(base_url=args.server, timeout=args.timeout, retries=args.retries, backoff=args.backoff)
+    cli = AdminCLI(client)
+    try:
+        await cli.run()
+    except KeyboardInterrupt:
+        prin("\nInterrupted", C.YELLOW)
+    finally:
+        await client.close()
+
+def main():
+    asyncio.run(main_async(sys.argv))
+
 if __name__ == "__main__":
-    parse_args_and_run()
+    main()
