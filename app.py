@@ -16,6 +16,7 @@ CONFIG_DIR = os.path.join(BASE_DIR, "config_data")
 os.makedirs(CONFIG_DIR, exist_ok=True)
 
 CONFIG_FILE = os.path.join(CONFIG_DIR, "client_config.json")
+CLIENT_VERSION = "v.1.0.0-stable"
 
 DEFAULT_SERVER = "http://omx.dedyn.io:30174"
 TIMEOUT = 6 
@@ -551,13 +552,11 @@ def main_menu():
         user = CONFIG.get("username")
         print(f"{C.BOLD}{C.BLUE}╔══════════════════════════════════╗{C.END}")
         print(f"{C.BOLD}{C.BLUE}║        OMX Mail Client           ║{C.END}")
-        print(f"{C.BOLD}{C.BLUE}╚══════════════════════════════════╝{C.END}\n")
-
+        print(f"{C.BOLD}{C.BLUE}╚══════════════════════════════════╝{C.END}")
         if user:
             printc(f"Logged in as: {user}", C.GREEN)
         else:
             printc("Not logged in", C.YELLOW)
-
         printc("\nMain Menu:", C.CYAN)
         printc("[1] Login / Register", C.CYAN)
         printc("[2] Send Mail", C.CYAN)

@@ -40,9 +40,9 @@ LOCAL_DIR = os.path.join(BASE_DIR, "local_packages")
 UPDATE_DIR = os.path.join(BASE_DIR, "update")
 REQ_FILE = os.path.join(BASE_DIR, "requirements.txt")
 
-APP_URL = "https://raw.githubusercontent.com/Virensahtiofficial/omx/refs/heads/main/app.py"
-MAIN_URL = "https://raw.githubusercontent.com/Virensahtiofficial/omx/refs/heads/main/main.py"
-REQ_URL = "https://raw.githubusercontent.com/Virensahtiofficial/omx/refs/heads/main/requirements.txt"
+APP_URL = "https://raw.githubusercontent.com/optimum-modern-exchange/omx/refs/heads/main/app.py"
+MAIN_URL = "https://raw.githubusercontent.com/optimum-modern-exchange/omx/refs/heads/main/main.py"
+REQ_URL = "https://raw.githubusercontent.com/optimum-modern-exchange/omx/refs/heads/main/requirements.txt"
 
 LOG_PATH = os.path.join(BASE_DIR, "launcher_update.log")
 TIMEOUT = 8  # seconds for network ops
