@@ -26,11 +26,9 @@ os.makedirs(CONFIG_DIR, exist_ok=True)
 CONFIG_FILE = os.path.join(CONFIG_DIR, "client_config.json")
 CLIENT_VERSION = "v.1.0.2-stable"
 
-# server als IP en poort
 DEFAULT_SERVER_HOST = "omx.dedyn.io"
 DEFAULT_SERVER_PORT = 30174
 
-# handig combineren voor gebruik
 DEFAULT_SERVER = f"http://{DEFAULT_SERVER_HOST}:{DEFAULT_SERVER_PORT}"
 TIMEOUT = 6 
 PAGE_SIZE = 12
@@ -88,7 +86,6 @@ SERVER_URL = CONFIG.get("server_url", DEFAULT_SERVER)
 def parse_recipient_field(s: str):
     if not s:
         return []
-    # split on comma or whitespace
     parts = []
     if "," in s:
         parts = [p.strip() for p in s.split(",")]
@@ -209,7 +206,7 @@ def user_register():
         if ok2 and resp2.get("token"):
             CONFIG["username"] = username
             CONFIG["token"] = resp2.get("token")
-            CONFIG["password"] = password  # optional but handy for sensitive ops; you may remove if not wanted
+            CONFIG["password"] = password
             save_config()
             printc("Auto-logged in and token saved.", C.GREEN)
             pause()
@@ -261,12 +258,11 @@ def send_request(endpoint, payload):
         with httpx.Client(timeout=TIMEOUT) as client:
             r = client.post(f"http://{DEFAULT_SERVER_HOST}:{DEFAULT_SERVER_PORT}{endpoint}",
                             json=payload, headers=headers)
-            r.raise_for_status()  # raise bij HTTP errors (4xx/5xx)
+            r.raise_for_status()
             resp = r.json()
             if resp.get("ok"):
                 return True, resp
             else:
-                # server gaf een foutmelding terug
                 err_msg = resp.get("error") or "Unknown server error"
                 return False, {"error": err_msg}
     except httpx.TimeoutException:
@@ -678,8 +674,8 @@ def main_menu():
             interactive_read("sent")
 
         elif choice == "5":
-            interactive_read("deleted")  # later kan je hier recover optie toevoegen
-
+            interactive_read("deleted") 
+            
         elif choice == "6":
             clear_screen()
             printc("Spam Menu:", C.CYAN)
